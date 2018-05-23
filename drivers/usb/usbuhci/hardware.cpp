@@ -220,7 +220,7 @@ CUSBHardwareDevice::Initialize(
     Status = GetBusInterface(PhysicalDeviceObject, &BusInterface);
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("Failed to get BusInterface!\n");
+        DPRINT1("Failed to get BusInteface!\n");
         return Status;
     }
 
@@ -623,7 +623,7 @@ CUSBHardwareDevice::InitializeController()
     Status = GetBusInterface(m_PhysicalDeviceObject, &BusInterface);
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("Failed to get BusInterface!\n");
+        DPRINT1("Failed to get BusInteface!\n");
         return Status;
     }
 
@@ -899,7 +899,6 @@ CUSBHardwareDevice::ResetPort(
 {
     ULONG Port;
     USHORT Status;
-    ULONG Index;
     LARGE_INTEGER Timeout;
 
     DPRINT("[UHCI] ResetPort Id %lu\n", PortIndex);
@@ -907,19 +906,24 @@ CUSBHardwareDevice::ResetPort(
     //
     // sanity check
     //
-    ASSERT(PortIndex <= 1);
+    if (PortIndex > 1) return STATUS_UNSUCCESSFUL;
 
     //
     // get register offset
     //
     Port = UHCI_PORTSC1 + PortIndex * 2;
+    m_PortResetChange &= ~(1 << PortIndex);
 
     //
     // read port status
     //
     Status = ReadRegister16(Port);
 
-
+    if ((Status & UHCI_PORTSC_CURSTAT) == 0) 
+    {
+         // no device connected. 
+         return STATUS_UNSUCCESSFUL;
+     }
 
     //
     // remove unwanted bits
@@ -936,7 +940,6 @@ CUSBHardwareDevice::ResetPort(
     //
     Timeout.QuadPart = 20;
     DPRINT("Waiting %lu milliseconds for port reset\n", Timeout.LowPart);
-
     //
     // convert to 100 ns units (absolute)
     //
@@ -962,68 +965,61 @@ CUSBHardwareDevice::ResetPort(
     //
     WriteRegister16(Port, (Status & ~UHCI_PORTSC_RESET));
 
-
     //
-    // now wait a bit
+    // wait a bit
     //
     KeStallExecutionProcessor(10);
 
-    for (Index = 0; Index < 100; Index++) 
+    //
+    // re-read status
+    //
+    Status = ReadRegister16(Port);
+
+    //
+    // remove unwanted bits
+    //
+    Status &= UHCI_PORTSC_DATAMASK;
+
+    // enable port
+    WriteRegister16(Port, Status | UHCI_PORTSC_ENABLED);
+
+    //
+    // wait a bit
+    //
+    KeStallExecutionProcessor(50);
+
+    //
+    // re-read port
+    //
+    Status = ReadRegister16(Port);
+
+    if ((Status & UHCI_PORTSC_CURSTAT) == 0) 
     {
-        // read port status
-        Status = ReadRegister16(Port);
+        // no device connected. since we waited long enough we can assume
+        // that the port was reset and no device is connected.
+        return STATUS_UNSUCCESSFUL;
+    }
 
+    if (!(Status & UHCI_PORTSC_ENABLED)) 
+    {
+        // the port is not enabled
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (Status & (UHCI_PORTSC_STATCHA | UHCI_PORTSC_ENABCHA))
+    {
+        // port enabled changed or connection status were set.
+        // acknowledge either / both.
+
+        //
         // remove unwanted bits
-        Status &= UHCI_PORTSC_DATAMASK;
-
-        // enable port
-        WriteRegister16(Port, Status | UHCI_PORTSC_ENABLED);
-
         //
-        // wait a bit
-        //
-        KeStallExecutionProcessor(50);
+        Status &= (UHCI_PORTSC_DATAMASK | UHCI_PORTSC_STATCHA | UHCI_PORTSC_ENABCHA);
 
-        //
-        // re-read port
-        //
-        Status = ReadRegister16(Port);
-
-        if ((Status & UHCI_PORTSC_CURSTAT) == 0) 
-        {
-            // no device connected. since we waited long enough we can assume
-            // that the port was reset and no device is connected.
-            break;
-        }
-
-        if (Status & (UHCI_PORTSC_STATCHA | UHCI_PORTSC_ENABCHA)) 
-        {
-            // port enabled changed or connection status were set.
-            // acknowledge either / both and wait again.
-            WriteRegister16(Port, Status);
-            continue;
-        }
-
-        if (Status & UHCI_PORTSC_ENABLED) 
-        {
-            // the port is enabled
-            break;
-        }
+        WriteRegister16(Port, Status);
     }
 
     m_PortResetChange |= (1 << PortIndex);
-    DPRINT("[USBUHCI] Port Index %x Status after reset %x\n", PortIndex, ReadRegister16(Port));
-
-    //
-    // is there a callback
-    //
-    if (m_SCECallBack)
-    {
-        //
-        // issue callback
-        //
-        m_SCECallBack(m_SCEContext);
-    }
 
     return STATUS_SUCCESS;
 }
@@ -1088,7 +1084,10 @@ CUSBHardwareDevice::GetPortStatus(
 
     if (Status & UHCI_PORTSC_ENABCHA)
     {
-        *PortChange |= USB_PORT_STATUS_ENABLE;
+          if (!(Status & UHCI_PORTSC_ENABLED))
+          {
+                *PortChange |= USB_PORT_STATUS_ENABLE;
+          }
     }
 
     if (m_PortResetChange & (1 << PortId))
@@ -1110,6 +1109,7 @@ CUSBHardwareDevice::ClearPortStatus(
 {
     ULONG PortRegister;
     USHORT PortStatus;
+    LARGE_INTEGER Timeout;
 
     DPRINT("CUSBHardwareDevice::ClearPortStatus PortId %x Feature %x\n", PortId, Feature);
 
@@ -1122,7 +1122,7 @@ CUSBHardwareDevice::ClearPortStatus(
         // invalid index
         //
         DPRINT1("[UHCI] Invalid PortIndex %lu\n", PortId);
-        return STATUS_INVALID_PARAMETER;
+        return STATUS_UNSUCCESSFUL;
     }
 
     //
@@ -1138,15 +1138,54 @@ CUSBHardwareDevice::ClearPortStatus(
         // UHCI is not supporting port reset register bit
         //
         m_PortResetChange &= ~(1 << PortId);
+
+        //
+        // delay is 50 ms
+        //
+        Timeout.QuadPart = 50;
+        DPRINT1("Waiting %lu milliseconds for port to stabilize after reset\n", Timeout.LowPart);
+        //
+        // convert to 100 ns units (absolute)
+        //
+        Timeout.QuadPart *= -10000;
+
+        //
+        // perform the wait
+        //
+        KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
     }
     else if (Feature == C_PORT_CONNECTION || Feature == C_PORT_ENABLE)
     {
         //
         // clear port status changes
         //
-        WriteRegister16(PortRegister, PortStatus);
-    }
 
+        // remove unwanted bits
+        PortStatus &= (UHCI_PORTSC_DATAMASK | UHCI_PORTSC_STATCHA | UHCI_PORTSC_ENABCHA);
+
+        WriteRegister16(PortRegister, PortStatus);
+
+        if ((Feature == C_PORT_CONNECTION) && (PortStatus & UHCI_PORTSC_CURSTAT))
+              {
+                   //
+                   // delay is 100 ms
+                   //
+
+                   Timeout.QuadPart = 100;
+
+                   DPRINT1("Waiting %lu milliseconds for port to stabilize after connection\n", Timeout.LowPart);
+
+                   //
+                   // convert to 100 ns units (absolute)
+                   //
+                   Timeout.QuadPart *= -10000;
+
+                   //
+                   // perform the wait
+                   //
+                   KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
+              }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -1156,6 +1195,7 @@ CUSBHardwareDevice::SetPortFeature(
     ULONG PortId,
     ULONG Feature)
 {
+    USHORT Status;
     ULONG PortRegister;
 
     DPRINT("[UHCI] SetPortFeature PortId %x Feature %x\n", PortId, Feature);
@@ -1174,20 +1214,66 @@ CUSBHardwareDevice::SetPortFeature(
 
     PortRegister = UHCI_PORTSC1 + PortId * 2;
 
+    //
+    // read status
+    //
+    Status = ReadRegister16(PortRegister);
+
     if (Feature == PORT_RESET)
     {
         //
         // reset port
         //
-        return ResetPort(PortId); 
+        if (!(ResetPort(PortId) == STATUS_SUCCESS))  return STATUS_UNSUCCESSFUL; 
+
+        //
+        // is there a callback
+        //
+        if (m_SCECallBack)
+        {
+            //
+            // issue callback
+            //
+            m_SCECallBack(m_SCEContext);
+        }
     }
+
     else if (Feature == PORT_ENABLE)
     {
+        if (!(Status & UHCI_PORTSC_CURSTAT)) return STATUS_UNSUCCESSFUL;
+
+        // remove unwanted bits
+        Status &= UHCI_PORTSC_DATAMASK;
+
         //
-        // reset port
+        // enable port
         //
-        WriteRegister16(PortRegister, ReadRegister16(PortRegister) | UHCI_PORTSC_ENABLED);
+        WriteRegister16(PortRegister, Status | UHCI_PORTSC_ENABLED);
+
+        //
+        // wait a bit
+        //
+        KeStallExecutionProcessor(50);
+
+        //
+        // read status
+        //
+        Status = ReadRegister16(PortRegister);
+
+        if (!(Status & UHCI_PORTSC_ENABLED)) return STATUS_UNSUCCESSFUL;
+
+        else if (Status & (UHCI_PORTSC_STATCHA | UHCI_PORTSC_ENABCHA))
+        {
+             // port enabled changed.
+             // acknowledge.
+
+             // remove unwanted bits
+             Status &= (UHCI_PORTSC_DATAMASK | UHCI_PORTSC_STATCHA | UHCI_PORTSC_ENABCHA);
+
+             WriteRegister16(PortRegister, Status);
+         }
     }
+
     else if (Feature == PORT_POWER)
     {
         //

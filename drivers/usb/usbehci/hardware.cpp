@@ -1,7 +1,7 @@
 /*
  * PROJECT:     ReactOS Universal Serial Bus Bulk Enhanced Host Controller Interface
  * LICENSE:     GPL - See COPYING in the top level directory
- * FILE:        drivers/usb/usbehci/hcd_controller.cpp
+ * FILE:        drivers/usb/usbehci/hardware.cpp
  * PURPOSE:     USB EHCI device driver.
  * PROGRAMMERS:
  *              Michael Martin (michael.martin@reactos.org)
@@ -98,7 +98,7 @@ protected:
     BOOLEAN m_DoorBellRingInProgress;                                                  // door bell ring in progress
     WORK_QUEUE_ITEM m_StatusChangeWorkItem;                                            // work item for status change callback
     volatile LONG m_StatusChangeWorkItemStatus;                                        // work item status
-    ULONG m_SyncFramePhysAddr;                                                         // periodic frame list physical address
+    ULONG m_SyncFramePhysAddr, m_SyncFramePhysAddrHigh;                // periodic frame list physical address
     BUS_INTERFACE_STANDARD m_BusInterface;                                             // pci bus interface
     BOOLEAN m_PortResetInProgress[0xF];                                                // stores reset in progress (vbox hack)
 
@@ -403,7 +403,6 @@ CUSBHardwareDevice::PnpStart(
         }
     }
 
-
     //
     // zero device description
     //
@@ -415,7 +414,14 @@ CUSBHardwareDevice::PnpStart(
     DeviceDescription.Version = DEVICE_DESCRIPTION_VERSION;
     DeviceDescription.Master = TRUE;
     DeviceDescription.ScatterGather = TRUE;
-    DeviceDescription.Dma32BitAddresses = TRUE;
+    if (m_Capabilities.HCCParams.CurAddrBits)
+    {
+         DeviceDescription.Dma64BitAddresses = TRUE;
+    }
+    else
+    {
+         DeviceDescription.Dma32BitAddresses = TRUE;
+    }
     DeviceDescription.DmaWidth = Width32Bits;
     DeviceDescription.InterfaceType = PCIBus;
     DeviceDescription.MaximumLength = MAXULONG;
@@ -461,17 +467,33 @@ CUSBHardwareDevice::PnpStart(
     //
     m_MemoryManager->Allocate(sizeof(QUEUE_HEAD), (PVOID*)&AsyncQueueHead, &AsyncPhysicalAddress);
 
+    //
+    // Initialize a queuehead for the Async Register
+    //
+    RtlZeroMemory(AsyncQueueHead, sizeof(QUEUE_HEAD));
+
     AsyncQueueHead->PhysicalAddr = AsyncPhysicalAddress.LowPart;
     AsyncQueueHead->HorizontalLinkPointer = AsyncQueueHead->PhysicalAddr | QH_TYPE_QH;
     AsyncQueueHead->EndPointCharacteristics.HeadOfReclamation = TRUE;
     AsyncQueueHead->EndPointCharacteristics.EndPointSpeed = QH_ENDPOINT_HIGHSPEED;
-    AsyncQueueHead->Token.Bits.Halted = TRUE;
-
     AsyncQueueHead->EndPointCapabilities.NumberOfTransactionPerFrame = 0x01;
-    AsyncQueueHead->NextPointer = TERMINATE_POINTER;
-    AsyncQueueHead->CurrentLinkPointer = TERMINATE_POINTER;
+    AsyncQueueHead->CurrentLinkPointer = AsyncQueueHead->PhysicalAddr + 0x10;
+    //AsyncQueueHead->NextPointer = TERMINATE_POINTER;
+    //AsyncQueueHead->AlternateNextPointer = TERMINATE_POINTER;
+
+    //
+    // applying AMD SB600 USB freeze workaround
+    //
+    if(!((m_VendorID == 0x1002) && (m_DeviceID == 0x4386)))
+    {
+          AsyncQueueHead->NextPointer = AsyncQueueHead->CurrentLinkPointer | TERMINATE_POINTER;
+          AsyncQueueHead->AlternateNextPointer = AsyncQueueHead->CurrentLinkPointer | TERMINATE_POINTER;
+          AsyncQueueHead->Token.Bits.Halted = TRUE; //FIXME
+    }
 
     InitializeListHead(&AsyncQueueHead->LinkedQueueHeads);
+
+    m_DoorBellRingInProgress = FALSE;
 
     //
     // Initialize the UsbQueue now that we have an AdapterObject.
@@ -586,7 +608,7 @@ CUSBHardwareDevice::StartController(void)
                 Value = 1;
                 m_BusInterface.SetBusData(m_BusInterface.Context, PCI_WHICHSPACE_CONFIG, &Value, ExtendedCapsSupport+3, sizeof(UCHAR));
 
-                for(Index = 0; Index < 20; Index++)
+                for(Index = 0; Index < 10; Index++)
                 {
                     //
                     // get status
@@ -598,8 +620,7 @@ CUSBHardwareDevice::StartController(void)
                         // lets wait a bit
                         //
                         Timeout.QuadPart = 50;
-                        DPRINT1("Waiting %lu milliseconds for port reset\n", Timeout.LowPart);
-
+                        DPRINT1("Waiting %lu milliseconds for release bios ownership\n", Timeout.LowPart);
                         //
                         // convert to 100 ns units (absolute)
                         //
@@ -610,34 +631,40 @@ CUSBHardwareDevice::StartController(void)
                         //
                         KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
                     }
+                    else break;
                 }
-                if ((Caps & EHCI_LEGSUP_BIOSOWNED))
+                if ( !(Caps & EHCI_LEGSUP_BIOSOWNED))
+                {
+                    if ((Caps & EHCI_LEGSUP_OSOWNED))
+                    {
+                        //
+                        // HC OS Owned Semaphore EHCI 2.1.7
+                        //
+                        DPRINT1("[EHCI] acquired ownership\n");
+                    }
+                }
+                else
                 {
                     //
                     // failed to acquire ownership
                     //
                     DPRINT1("[EHCI] failed to acquire ownership\n");
-                }
-                else if ((Caps & EHCI_LEGSUP_OSOWNED))
-                {
-                    //
-                    // HC OS Owned Semaphore EHCI 2.1.7
-                    //
-                    DPRINT1("[EHCI] acquired ownership\n");
-                }
+                    //ASSERT(FALSE);
 #if 0
-                //
-                // explicitly clear the bios owned flag 2.1.7
-                //
-                Value = 0;
-                m_BusInterface.SetBusData(m_BusInterface.Context, PCI_WHICHSPACE_CONFIG, &Value, ExtendedCapsSupport+2, sizeof(UCHAR));
+                    //
+                    // explicitly clear the bios owned flag 2.1.7
+                    //
+                    Value = 0;
+                    m_BusInterface.SetBusData(m_BusInterface.Context, PCI_WHICHSPACE_CONFIG, &Value, ExtendedCapsSupport+2, sizeof(UCHAR));
 
-                //
-                // clear SMI interrupt EHCI 2.1.8
-                //
-                Caps = 4;
-                m_BusInterface.SetBusData(m_BusInterface.Context, PCI_WHICHSPACE_CONFIG, &Caps, ExtendedCapsSupport+4, sizeof(ULONG));
+                    //
+                    // clear SMI interrupt EHCI 2.1.8
+                    //
+                    Caps = 4;
+                    m_BusInterface.SetBusData(m_BusInterface.Context, PCI_WHICHSPACE_CONFIG, &Caps, ExtendedCapsSupport+4, sizeof(ULONG));
 #endif
+
+                }
             }
         }
     }
@@ -662,7 +689,7 @@ CUSBHardwareDevice::StartController(void)
         KeStallExecutionProcessor(100);
         UsbSts = EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
 
-        if (!(UsbSts & EHCI_STS_PSS) && (UsbSts & EHCI_STS_ASS))
+        if (!(UsbSts & EHCI_STS_PSS) && !(UsbSts & EHCI_STS_ASS))
         {
             break;
         }
@@ -696,10 +723,20 @@ CUSBHardwareDevice::StartController(void)
     if (m_Capabilities.HCCParams.CurAddrBits)
     {
         //
-        // disable 64-bit addressing
+        // set 64-bit addressing segment
         //
-        EHCI_WRITE_REGISTER_ULONG(EHCI_CTRLDSSEGMENT, 0x0);
+        EHCI_WRITE_REGISTER_ULONG(EHCI_CTRLDSSEGMENT, m_SyncFramePhysAddrHigh);
     }
+
+    //
+    // Assign the SyncList Register
+    //
+    EHCI_WRITE_REGISTER_ULONG(EHCI_PERIODICLISTBASE, m_SyncFramePhysAddr);
+
+    //
+    // Assign the AsyncList Register
+    //
+    EHCI_WRITE_REGISTER_ULONG(EHCI_ASYNCLISTBASE, AsyncQueueHead->PhysicalAddr);
 
     //
     // Enable Interrupts and start execution
@@ -709,24 +746,18 @@ CUSBHardwareDevice::StartController(void)
 
     KeStallExecutionProcessor(10);
 
-    ULONG Status = EHCI_READ_REGISTER_ULONG(EHCI_USBINTR);
-
-    DPRINT1("Interrupt Mask %x\n", Status);
-    ASSERT((Status & Mask) == Mask);
-
-    //
-    // Assign the SyncList Register
-    //
-    EHCI_WRITE_REGISTER_ULONG(EHCI_PERIODICLISTBASE, m_SyncFramePhysAddr);
-
-    //
-    // Set Schedules to Enable and Interrupt Threshold to 1ms.
-    //
     RtlZeroMemory(&UsbCmd, sizeof(EHCI_USBCMD_CONTENT));
 
-    UsbCmd.PeriodicEnable = TRUE;
+    //
+    // get command register
+    //
+    GetCommandRegister(&UsbCmd);
+
+    //
+    // Set Interrupt Threshold to 1ms and Periodic Frame List Size to 1024.
+    //
+
     UsbCmd.IntThreshold = 0x8; //1ms
-    UsbCmd.Run = TRUE;
     UsbCmd.FrameListSize = 0x0; //1024
 
     if (m_Capabilities.HCCParams.ParkMode)
@@ -738,8 +769,11 @@ CUSBHardwareDevice::StartController(void)
         UsbCmd.AsyncParkCount = 3;
     }
 
+    //
+    // Start execution
+    //
+    UsbCmd.Run = TRUE;
     SetCommandRegister(&UsbCmd);
-
 
     //
     // Wait for execution to start
@@ -749,7 +783,7 @@ CUSBHardwareDevice::StartController(void)
         KeStallExecutionProcessor(100);
         UsbSts = EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
 
-        if (!(UsbSts & EHCI_STS_HALT) && (UsbSts & EHCI_STS_PSS))
+        if (!(UsbSts & EHCI_STS_HALT))
         {
             break;
         }
@@ -762,31 +796,11 @@ CUSBHardwareDevice::StartController(void)
         return STATUS_UNSUCCESSFUL;
     }
 
-    if (!(UsbSts & EHCI_STS_PSS))
-    {
-        DPRINT1("Could not enable periodic scheduling\n");
-        //ASSERT(FALSE);
-        return STATUS_UNSUCCESSFUL;
-    }
+    // Set Periodic Schedules to Enable
 
-    //
-    // Assign the AsyncList Register
-    //
-    EHCI_WRITE_REGISTER_ULONG(EHCI_ASYNCLISTBASE, AsyncQueueHead->PhysicalAddr);
-
-    //
-    // get command register
-    //
     GetCommandRegister(&UsbCmd);
 
-    //
-    // preserve bits
-    //
-    UsbCmd.AsyncEnable = TRUE;
-
-    //
-    // enable async
-    //
+    UsbCmd.PeriodicEnable = TRUE;
     SetCommandRegister(&UsbCmd);
 
     //
@@ -797,7 +811,35 @@ CUSBHardwareDevice::StartController(void)
         KeStallExecutionProcessor(100);
         UsbSts = EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
 
-        if ((UsbSts & EHCI_STS_ASS))
+        if (UsbSts & EHCI_STS_PSS)
+        {
+            break;
+        }
+    }
+
+    if (!(UsbSts & EHCI_STS_PSS))
+    {
+        DPRINT1("Could not enable periodic scheduling\n");
+        //ASSERT(FALSE);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    // Set Async Schedules to Enable
+
+    GetCommandRegister(&UsbCmd);
+
+    UsbCmd.AsyncEnable = TRUE;
+    SetCommandRegister(&UsbCmd);
+
+    //
+    // Wait for execution to start
+    //
+    for (FailSafe = 100; FailSafe > 1; FailSafe--)
+    {
+        KeStallExecutionProcessor(100);
+        UsbSts = EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
+
+        if (UsbSts & EHCI_STS_ASS)
         {
             break;
         }
@@ -809,6 +851,11 @@ CUSBHardwareDevice::StartController(void)
         //ASSERT(FALSE);
         return STATUS_UNSUCCESSFUL;
     }
+
+    ULONG Status = EHCI_READ_REGISTER_ULONG(EHCI_USBINTR);
+
+    DPRINT1("Interrupt Mask %x\n", Status);
+    ASSERT((Status & Mask) == Mask);
 
     DPRINT1("UsbSts %x\n", UsbSts);
     GetCommandRegister(&UsbCmd);
@@ -834,18 +881,21 @@ CUSBHardwareDevice::StopController(void)
     EHCI_USBCMD_CONTENT UsbCmd;
     ULONG UsbSts, FailSafe;
 
-    //
-    // Disable Interrupts and stop execution
-    //
-    EHCI_WRITE_REGISTER_ULONG (EHCI_USBINTR, 0);
+    UsbSts = EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
+    if (!(UsbSts & EHCI_STS_HALT))
+    {
+        //
+        // Disable Interrupts and stop execution
+        //
+        EHCI_WRITE_REGISTER_ULONG (EHCI_USBINTR, 0);
 
-    GetCommandRegister(&UsbCmd);
-    UsbCmd.Run = FALSE;
-    SetCommandRegister(&UsbCmd);
-
+        GetCommandRegister(&UsbCmd);
+        UsbCmd.Run = FALSE;
+        SetCommandRegister(&UsbCmd);
+    }
     for (FailSafe = 100; FailSafe > 1; FailSafe--)
     {
-        KeStallExecutionProcessor(10);
+        KeStallExecutionProcessor(100);
         UsbSts = EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
         if (UsbSts & EHCI_STS_HALT)
         {
@@ -902,14 +952,25 @@ CUSBHardwareDevice::ResetPort(
 
     PortStatus = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex));
 
-    ASSERT(!EHCI_IS_LOW_SPEED(PortStatus));
-    ASSERT(PortStatus & EHCI_PRT_CONNECTED);
+    if (!(PortStatus & EHCI_PRT_CONNECTED))
+        {
+            DPRINT1("No device is here on reset. Bad controller/device?\n");
+            return STATUS_DEVICE_NOT_CONNECTED;
+        }
+
+    if (EHCI_IS_LOW_SPEED(PortStatus))
+        {
+            DPRINT1("Low speed device connected. Releasing ownership\n");
+            PortStatus &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
+            EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex), PortStatus | EHCI_PRT_RELEASEOWNERSHIP);
+            return STATUS_DEVICE_NOT_CONNECTED;
+        }
 
     //
     // Reset and clean enable
     //
-    PortStatus |= EHCI_PRT_RESET;
     PortStatus &= EHCI_PORTSC_DATAMASK;
+    PortStatus |= EHCI_PRT_RESET;
     EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex), PortStatus);
 
     //
@@ -917,7 +978,6 @@ CUSBHardwareDevice::ResetPort(
     //
     Timeout.QuadPart = 50;
     DPRINT1("Waiting %lu milliseconds for port reset\n", Timeout.LowPart);
-
     //
     // convert to 100 ns units (absolute)
     //
@@ -927,6 +987,47 @@ CUSBHardwareDevice::ResetPort(
     // perform the wait
     //
     KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
+
+    PortStatus = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex));
+
+    // Clear reset
+    PortStatus &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
+    PortStatus &= ~EHCI_PRT_RESET;
+    EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex), PortStatus);
+
+    //
+    // wait for reset bit to clear
+    //
+    do
+    {
+        PortStatus = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex));
+
+        if (!(PortStatus & EHCI_PRT_RESET))
+            break;
+
+        KeStallExecutionProcessor(20);
+     } while (TRUE);
+
+     //
+     // check the port status after reset clear
+     //
+     PortStatus = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex));
+     if (!(PortStatus & EHCI_PRT_CONNECTED))
+     {
+         DPRINT1("No device is here after reset. Bad controller/device?\n");
+         return STATUS_DEVICE_NOT_CONNECTED;
+     }
+     else if (!(PortStatus & EHCI_PRT_ENABLED))
+     {
+         DPRINT1("Full speed device connected. Releasing ownership\n");
+         PortStatus &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
+         EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortIndex), PortStatus | EHCI_PRT_RELEASEOWNERSHIP);
+         return STATUS_DEVICE_NOT_CONNECTED;
+     }
+     else
+     {
+         DPRINT1("High speed device connected\n");
+     }
 
     return STATUS_SUCCESS;
 }
@@ -986,9 +1087,13 @@ CUSBHardwareDevice::GetPortStatus(
         Status |= USB_PORT_STATUS_OVER_CURRENT;
 
     // In a reset state?
-    if ((Value & EHCI_PRT_RESET) || m_PortResetInProgress[PortId])
+    if (Value & EHCI_PRT_RESET)
     {
         Status |= USB_PORT_STATUS_RESET;
+    }
+
+    if (m_PortResetInProgress[PortId])
+    {
         Change |= USB_PORT_STATUS_RESET;
     }
 
@@ -998,7 +1103,8 @@ CUSBHardwareDevice::GetPortStatus(
 
     // This is set to indicate a critical port error
     if (Value & EHCI_PRT_ENABLEDSTATUSCHANGE)
-        Change |= USB_PORT_STATUS_ENABLE;
+        if (!(Value & EHCI_PRT_ENABLED))
+            Change |= USB_PORT_STATUS_ENABLE;
 
     *PortStatus = Status;
     *PortChange = Change;
@@ -1022,33 +1128,15 @@ CUSBHardwareDevice::ClearPortStatus(
 
     if (Status == C_PORT_RESET)
     {
+        if(m_PortResetInProgress[PortId] == FALSE) return STATUS_SUCCESS;
+
         // reset done
         m_PortResetInProgress[PortId] = FALSE;
 
-        // Clear reset
-        Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
-        Value &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
-        Value &= ~EHCI_PRT_RESET;
-        EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value);
-
         //
-        // wait for reset bit to clear
+        // delay is 10 ms
         //
-        do
-        {
-            Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
-
-            if (!(Value & EHCI_PRT_RESET))
-                break;
-
-            KeStallExecutionProcessor(20);
-        } while (TRUE);
-
-        //
-        // delay is 50 ms
-        //
-        Timeout.QuadPart = 50;
-        DPRINT1("Waiting %lu milliseconds for port to recover after reset\n", Timeout.LowPart);
+        Timeout.QuadPart = 100;
 
         //
         // convert to 100 ns units (absolute)
@@ -1059,50 +1147,23 @@ CUSBHardwareDevice::ClearPortStatus(
         // perform the wait
         //
         KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
-
-        //
-        // check the port status after reset
-        //
-        Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
-        if (!(Value & EHCI_PRT_CONNECTED))
-        {
-            DPRINT1("No device is here after reset. Bad controller/device?\n");
-            return STATUS_UNSUCCESSFUL;
-        }
-        else if (EHCI_IS_LOW_SPEED(Value))
-        {
-            DPRINT1("Low speed device connected. Releasing ownership\n");
-            EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value | EHCI_PRT_RELEASEOWNERSHIP);
-            return STATUS_DEVICE_NOT_CONNECTED;
-        }
-        else if (!(Value & EHCI_PRT_ENABLED))
-        {
-            DPRINT1("Full speed device connected. Releasing ownership\n");
-            EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value | EHCI_PRT_RELEASEOWNERSHIP);
-            return STATUS_DEVICE_NOT_CONNECTED;
-        }
-        else
-        {
-            DPRINT1("High speed device connected\n");
-            return STATUS_SUCCESS;
-        }
     }
     else if (Status == C_PORT_CONNECTION)
     {
         //
-        // reset status change bits
+        // reset status change bit
         //
         Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
-        EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value);
+        Value &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
+        EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value | EHCI_PRT_CONNECTSTATUSCHANGE);
 
-        if (Value & EHCI_PRT_CONNECTED)
+        if (Status == C_PORT_CONNECTION && (Value & EHCI_PRT_CONNECTED))
         {
             //
             // delay is 100 ms
             //
             Timeout.QuadPart = 100;
             DPRINT1("Waiting %lu milliseconds for port to stabilize after connection\n", Timeout.LowPart);
-
             //
             // convert to 100 ns units (absolute)
             //
@@ -1113,6 +1174,15 @@ CUSBHardwareDevice::ClearPortStatus(
             //
             KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
         }
+    }
+    else if (Status == C_PORT_ENABLE)
+    {
+        //
+        // reset status change bit
+        //
+        Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
+        Value &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
+        EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value | EHCI_PRT_ENABLEDSTATUSCHANGE);
     }
 
     return STATUS_SUCCESS;
@@ -1125,6 +1195,10 @@ CUSBHardwareDevice::SetPortFeature(
     ULONG PortId,
     ULONG Feature)
 {
+    ULONG Value;
+    LARGE_INTEGER Timeout;
+    NTSTATUS Status;
+
     DPRINT("CUSBHardwareDevice::SetPortFeature\n");
 
     if (PortId > m_Capabilities.HCSParams.PortCount)
@@ -1133,21 +1207,30 @@ CUSBHardwareDevice::SetPortFeature(
     if (Feature == PORT_ENABLE)
     {
         //
-        // FIXME: EHCI Ports can only be disabled via reset
+        // FIXME: EHCI Ports can only be enabled via reset
         //
         DPRINT1("PORT_ENABLE not supported for EHCI\n");
+        Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
+        if (!(Value & EHCI_PRT_ENABLED))
+            return STATUS_UNSUCCESSFUL;
     }
 
     if (Feature == PORT_RESET)
     {
+        m_PortResetInProgress[PortId] = FALSE;
         //
         // call the helper
         //
-        ResetPort(PortId);
-
-        // reset in progress
-        m_PortResetInProgress[PortId] = TRUE;
-
+        Status = ResetPort(PortId);
+        if(Status == STATUS_SUCCESS) 
+        {
+            // reset in progress
+            m_PortResetInProgress[PortId] = TRUE;
+        }
+        else
+        {
+            return Status;
+        }
         //
         // is there a status change callback
         //
@@ -1164,21 +1247,19 @@ CUSBHardwareDevice::SetPortFeature(
     {
         if (m_Capabilities.HCSParams.PortPowerControl)
         {
-            ULONG Value;
-            LARGE_INTEGER Timeout;
 
             //
             // enable port power
             //
-            Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId)) | EHCI_PRT_POWER;
-            EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value);
+            Value = EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId));
+            Value &= (EHCI_PORTSC_DATAMASK | EHCI_PRT_ENABLED);
+            EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * PortId), Value | EHCI_PRT_POWER);
 
             //
-            // delay is 20 ms
+            // delay is 100 ms
             //
-            Timeout.QuadPart = 20;
+            Timeout.QuadPart = 100;
             DPRINT1("Waiting %lu milliseconds for port power up\n", Timeout.LowPart);
-
             //
             // convert to 100 ns units (absolute)
             //
@@ -1204,12 +1285,13 @@ CUSBHardwareDevice::SetAsyncListRegister(
 VOID
 STDMETHODCALLTYPE
 CUSBHardwareDevice::SetPeriodicListRegister(
-    ULONG PhysicalAddress)
+    ULONG PhysicalAddress, ULONG PhysicalAddressHigh)
 {
     //
     // store physical address
     //
     m_SyncFramePhysAddr = PhysicalAddress;
+    m_SyncFramePhysAddrHigh = PhysicalAddressHigh;
 }
 
 struct _QUEUE_HEAD *
@@ -1244,45 +1326,26 @@ InterruptServiceRoutine(
     IN PVOID  ServiceContext)
 {
     CUSBHardwareDevice *This;
-    ULONG CStatus;
+    ULONG CStatus, Masked_CStatus;
 
     This = (CUSBHardwareDevice*) ServiceContext;
     CStatus = This->EHCI_READ_REGISTER_ULONG(EHCI_USBSTS);
 
-    CStatus &= (EHCI_ERROR_INT | EHCI_STS_INT | EHCI_STS_IAA | EHCI_STS_PCD | EHCI_STS_FLR);
-    DPRINT("InterruptServiceRoutine CStatus %lx\n", CStatus);
+    Masked_CStatus = CStatus & (EHCI_ERROR_INT | EHCI_STS_INT | EHCI_STS_IAA | EHCI_STS_PCD | EHCI_STS_FLR);
+    //DPRINT("InterruptServiceRoutine CStatus %lx\n", Masked_CStatus);
 
     //
     // Check that it belongs to EHCI
     //
-    if (!CStatus)
+    if (!Masked_CStatus)
         return FALSE;
 
     //
     // Clear the Status
     //
-    This->EHCI_WRITE_REGISTER_ULONG(EHCI_USBSTS, CStatus);
+    This->EHCI_WRITE_REGISTER_ULONG(EHCI_USBSTS, Masked_CStatus);
 
-    if (CStatus & EHCI_STS_FATAL)
-    {
-        This->StopController();
-        DPRINT1("EHCI: Host System Error!\n");
-        return TRUE;
-    }
-
-    if (CStatus & EHCI_ERROR_INT)
-    {
-        DPRINT1("EHCI Status = 0x%x\n", CStatus);
-    }
-
-    if (CStatus & EHCI_STS_HALT)
-    {
-        DPRINT1("Host Error Unexpected Halt\n");
-        // FIXME: Reset controller\n");
-        return TRUE;
-    }
-
-    KeInsertQueueDpc(&This->m_IntDpcObject, This, (PVOID)CStatus);
+    KeInsertQueueDpc(&This->m_IntDpcObject, (PVOID)CStatus, NULL);
     return TRUE;
 }
 
@@ -1294,65 +1357,31 @@ EhciDeferredRoutine(
     IN PVOID SystemArgument2)
 {
     CUSBHardwareDevice *This;
-    ULONG CStatus, PortStatus, PortCount, i, ShouldRingDoorBell, QueueSCEWorkItem;
+    ULONG CStatus, ShouldRingDoorBell, QueueSCEWorkItem;
+    //ULONG PortStatus, PortCount, i;
     NTSTATUS Status = STATUS_SUCCESS;
     EHCI_USBCMD_CONTENT UsbCmd;
 
-    This = (CUSBHardwareDevice*) SystemArgument1;
-    CStatus = (ULONG) SystemArgument2;
+    This = (CUSBHardwareDevice*) DeferredContext;
+    CStatus = (ULONG) SystemArgument1;
 
-    DPRINT("EhciDeferredRoutine CStatus %lx\n", CStatus);
+    DPRINT1("EhciDefferedRoutine CStatus %lx\n", CStatus);
 
     //
-    // check for completion of async schedule
+    // check for controller reported error
     //
-    if (CStatus & (EHCI_STS_RECL| EHCI_STS_INT | EHCI_ERROR_INT))
+    if (CStatus & EHCI_STS_FATAL)
     {
-        //
-        // check if there is a door bell ring in progress
-        //
-        if (This->m_DoorBellRingInProgress == FALSE)
-        {
-            if (CStatus & EHCI_ERROR_INT)
-            {
-                //
-                // controller reported error
-                //
-                DPRINT1("CStatus %lx\n", CStatus);
-                //ASSERT(FALSE);
-            }
+        //This->StopController();
+        DPRINT1("EHCI: Host System Error!\n");
+        return;
+    }
 
-            //
-            // inform IUSBQueue of a completed queue head
-            //
-            This->m_UsbQueue->InterruptCallback(Status, &ShouldRingDoorBell);
-
-            //
-            // was a queue head completed?
-            //
-            if (ShouldRingDoorBell)
-            {
-                //
-                // set door ring bell in progress status flag
-                //
-                This->m_DoorBellRingInProgress = TRUE;
-
-                //
-                // get command register
-                //
-                This->GetCommandRegister(&UsbCmd);
-
-                //
-                // set door rang bell bit
-                //
-                UsbCmd.DoorBell = TRUE;
-
-                //
-                // update command status
-                //
-                This->SetCommandRegister(&UsbCmd);
-            }
-        }
+    if (CStatus & EHCI_STS_HALT)
+    {
+        DPRINT1("Host Error Unexpected Halt\n");
+        // FIXME: Reset controller\n");
+        return;
     }
 
     //
@@ -1366,20 +1395,81 @@ EhciDeferredRoutine(
         PC_ASSERT(This->m_DoorBellRingInProgress == TRUE);
 
         //
-        // now notify IUSBQueue that it can free completed requests
+        // check door rang bell bit
         //
-        This->m_UsbQueue->CompleteAsyncRequests();
+        while(TRUE)
+        {
+             //
+             // get command register
+             //
+             This->GetCommandRegister(&UsbCmd);
+
+             if(UsbCmd.DoorBell == FALSE) break;
+         }
 
         //
         // door ring bell completed
         //
         This->m_DoorBellRingInProgress = FALSE;
+
+        //
+        // now notify IUSBQueue that it can free completed requests
+        //
+        This->m_UsbQueue->CompleteAsyncRequests();
     }
 
-    This->GetDeviceDetails(NULL, NULL, &PortCount, NULL);
+    //
+    // check for completion of async schedule
+    //
+    if (CStatus & (EHCI_STS_INT | EHCI_STS_ERR))
+    {
+        if (CStatus & EHCI_STS_ERR)
+        {
+            //
+            // controller reported error
+            //
+            DPRINT1("EHCI ERR INT CStatus 0x%lx\n", CStatus);
+            //ASSERT(FALSE);
+        }
+
+        //
+        // inform IUSBQueue of a completed queue head
+        //
+        This->m_UsbQueue->InterruptCallback(Status, &ShouldRingDoorBell);
+
+        //
+        // was a queue head completed?
+        //
+        if (ShouldRingDoorBell)
+        {
+             //
+             // get command register
+             //
+             This->GetCommandRegister(&UsbCmd);
+
+             //
+             // set door rang bell bit
+             //
+             UsbCmd.DoorBell = TRUE;
+
+             //
+             // update command status
+             //
+             This->SetCommandRegister(&UsbCmd);
+
+             //
+             // set door ring bell in progress status flag
+             //
+             This->m_DoorBellRingInProgress = TRUE;
+
+         }
+    }
+
+    //This->GetDeviceDetails(NULL, NULL, &PortCount, NULL);
     if (CStatus & EHCI_STS_PCD)
     {
-        QueueSCEWorkItem = FALSE;
+
+#if 0
         for (i = 0; i < PortCount; i++)
         {
             PortStatus = This->EHCI_READ_REGISTER_ULONG(EHCI_PORTSC + (4 * i));
@@ -1391,40 +1481,34 @@ EhciDeferredRoutine(
             {
                 if (PortStatus & EHCI_PRT_CONNECTED)
                 {
-                    DPRINT1("Device connected on port %lu\n", i);
+                    //DPRINT1("Device connected on port %lu\n", i);
 
                     if (This->m_Capabilities.HCSParams.CHCCount)
                     {
                         if (PortStatus & EHCI_PRT_ENABLED)
                         {
                             DPRINT1("Misbehaving controller. Port should be disabled at this point\n");
-                        }
-
-                        if (EHCI_IS_LOW_SPEED(PortStatus))
-                        {
-                            DPRINT1("Low speed device connected. Releasing ownership\n");
-                            This->EHCI_WRITE_REGISTER_ULONG(EHCI_PORTSC + (4 * i), PortStatus | EHCI_PRT_RELEASEOWNERSHIP);
-                            continue;
+                            QueueSCEWorkItem = FALSE;
                         }
                     }
 
                     //
                     // work to do
                     //
-                    QueueSCEWorkItem = TRUE;
                 }
                 else
                 {
-                    DPRINT1("Device disconnected on port %lu\n", i);
+                    //DPRINT1("Device disconnected on port %lu\n", i);
 
                     //
                     // work to do
                     //
-                    QueueSCEWorkItem = TRUE;
                 }
             }
         }
+#endif
 
+        QueueSCEWorkItem = TRUE;
         //
         // is there a status change callback and a high speed device connected / disconnected
         //

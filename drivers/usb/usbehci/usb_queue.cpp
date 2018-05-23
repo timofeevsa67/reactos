@@ -179,6 +179,7 @@ CUSBQueue::InitializeSyncSchedule(
     IN PEHCIHARDWAREDEVICE Hardware,
     IN PDMAMEMORYMANAGER MemManager)
 {
+    USHORT Pci_VID, Pci_DID;
     PHYSICAL_ADDRESS QueueHeadPhysAddr;
     NTSTATUS Status;
     ULONG Index, Interval, IntervalIndex;
@@ -225,15 +226,33 @@ CUSBQueue::InitializeSyncSchedule(
         //
         // initialize queue head
         //
-        QueueHead->HorizontalLinkPointer = TERMINATE_POINTER;
-        QueueHead->AlternateNextPointer = TERMINATE_POINTER;
-        QueueHead->NextPointer = TERMINATE_POINTER;
+        RtlZeroMemory(QueueHead, sizeof(QUEUE_HEAD));
+
+        QueueHead->PhysicalAddr = QueueHeadPhysAddr.LowPart;
+        QueueHead->HorizontalLinkPointer = QueueHead->PhysicalAddr | QH_TYPE_QH | TERMINATE_POINTER;
+        //QueueHead->HorizontalLinkPointer = TERMINATE_POINTER;
+        QueueHead->EndPointCharacteristics.HeadOfReclamation = FALSE;
         QueueHead->EndPointCharacteristics.MaximumPacketLength = 64;
         QueueHead->EndPointCharacteristics.NakCountReload = 0x3;
         QueueHead->EndPointCharacteristics.EndPointSpeed = QH_ENDPOINT_HIGHSPEED;
+        QueueHead->EndPointCapabilities.InterruptScheduleMask = 0x01;
         QueueHead->EndPointCapabilities.NumberOfTransactionPerFrame = 0x01;
-        QueueHead->PhysicalAddr = QueueHeadPhysAddr.LowPart;
-        QueueHead->Token.Bits.Halted = TRUE; //FIXME
+        QueueHead->CurrentLinkPointer = QueueHead->PhysicalAddr + 0x10;
+        //QueueHead->NextPointer = TERMINATE_POINTER;
+        //QueueHead->AlternateNextPointer = TERMINATE_POINTER;
+
+        //
+        // applying AMD SB600 USB freeze workaround
+        //
+        Hardware->GetDeviceDetails(&Pci_VID, &Pci_DID, NULL, NULL);
+
+        if(!((Pci_VID == 0x1002) && (Pci_DID == 0x4386)))
+        {
+             QueueHead->NextPointer = QueueHead->CurrentLinkPointer | TERMINATE_POINTER;
+             QueueHead->AlternateNextPointer = QueueHead->CurrentLinkPointer | TERMINATE_POINTER;
+             QueueHead->Token.Bits.Halted = TRUE; //FIXME
+        }
+
         m_InterruptQueueHeads[Index]= QueueHead;
 
         if (Index > 0)
@@ -242,6 +261,11 @@ CUSBQueue::InitializeSyncSchedule(
              QueueHead->HorizontalLinkPointer = m_InterruptQueueHeads[0]->PhysicalAddr | QH_TYPE_QH;
              QueueHead->NextQueueHead = m_InterruptQueueHeads[0];
         }
+        else
+        {
+             QueueHead->NextQueueHead = QueueHead;
+        }
+
     }
 
     //
@@ -263,7 +287,7 @@ CUSBQueue::InitializeSyncSchedule(
     //
     // now set the sync base
     //
-    Hardware->SetPeriodicListRegister(m_SyncFrameListAddr.LowPart);
+    Hardware->SetPeriodicListRegister(m_SyncFrameListAddr.LowPart, m_SyncFrameListAddr.HighPart);
 
     //
     // sync frame list initialized
@@ -472,6 +496,7 @@ CUSBQueue::LinkQueueHead(
     ASSERT(HeadQueueHead);
     ASSERT(NewQueueHead);
 
+    //DPRINT1("Link QueueHead\n");
     //
     // Link the LIST_ENTRYs
     //
@@ -517,6 +542,7 @@ CUSBQueue::UnlinkQueueHead(
     //
     //PC_ASSERT(QueueHead->Token.Bits.Halted == 0);
 
+    //DPRINT1("Unlink QueueHead\n");
     //
     // get previous link
     //
@@ -545,7 +571,7 @@ CUSBQueue::UnlinkQueueHead(
     //
     // remove queue head from linked list
     //
-    PreviousQH->HorizontalLinkPointer = NextQH->PhysicalAddr | QH_TYPE_QH;
+    PreviousQH->HorizontalLinkPointer = (NextQH->PhysicalAddr | QH_TYPE_QH);
 
     //
     // remove software link
@@ -566,6 +592,9 @@ CUSBQueue::LinkQueueHeadChain(
     ASSERT(HeadQueueHead);
     ASSERT(NewQueueHead);
 
+
+    //DPRINT1("Link QueueHeadChain\n");
+
     //
     // Find the last QueueHead in NewQueueHead
     //
@@ -576,11 +605,11 @@ CUSBQueue::LinkQueueHeadChain(
     //
     // Set the LinkPointer and Flink
     //
-    LastQueueHead->HorizontalLinkPointer = HeadQueueHead->PhysicalAddr | QH_TYPE_QH;
+    LastQueueHead->HorizontalLinkPointer = (HeadQueueHead->PhysicalAddr | QH_TYPE_QH);
     LastQueueHead->LinkedQueueHeads.Flink = &HeadQueueHead->LinkedQueueHeads;
 
     //
-    // Fine the last QueueHead in HeadQueueHead
+    // Find the last QueueHead in HeadQueueHead
     //
     Entry = HeadQueueHead->LinkedQueueHeads.Blink;
     HeadQueueHead->LinkedQueueHeads.Blink = &LastQueueHead->LinkedQueueHeads;
@@ -598,40 +627,42 @@ CUSBQueue::UnlinkQueueHeadChain(
     PQUEUE_HEAD HeadQueueHead,
     ULONG Count)
 {
-    PQUEUE_HEAD LastQueueHead, FirstQueueHead;
+    PQUEUE_HEAD  LastQueueHead, FirstQueueHead;
     PLIST_ENTRY Entry;
     ULONG Index;
 
+    DPRINT1("Unlink QueueHeadChain\n");
+
     //
-    // Find the last QueueHead in NewQueueHead
+    // Find the last QueueHead in HeadQueueHead
     //
     Entry = &HeadQueueHead->LinkedQueueHeads;
     FirstQueueHead = CONTAINING_RECORD(Entry->Flink, QUEUE_HEAD, LinkedQueueHeads);
 
-    for (Index = 0; Index < Count; Index++)
+    for (Index = 1; Index <= Count; Index++)
     {
         Entry = Entry->Flink;
 
         if (Entry == &HeadQueueHead->LinkedQueueHeads)
         {
             DPRINT1("Warning; Only %lu QueueHeads in HeadQueueHead\n", Index);
-            Count = Index + 1;
             break;
         }
     }
 
     LastQueueHead = CONTAINING_RECORD(Entry, QUEUE_HEAD, LinkedQueueHeads);
     HeadQueueHead->LinkedQueueHeads.Flink = LastQueueHead->LinkedQueueHeads.Flink;
-    if (Count + 1 == Index)
+    HeadQueueHead->HorizontalLinkPointer = LastQueueHead->HorizontalLinkPointer;
+
+    if (Count > Index)
     {
         HeadQueueHead->LinkedQueueHeads.Blink = &HeadQueueHead->LinkedQueueHeads;
     }
-    else
-        HeadQueueHead->LinkedQueueHeads.Blink = LastQueueHead->LinkedQueueHeads.Flink;
 
     FirstQueueHead->LinkedQueueHeads.Blink = &LastQueueHead->LinkedQueueHeads;
     LastQueueHead->LinkedQueueHeads.Flink = &FirstQueueHead->LinkedQueueHeads;
     LastQueueHead->HorizontalLinkPointer = TERMINATE_POINTER;
+
     return FirstQueueHead;
 }
 
@@ -887,6 +918,7 @@ CUSBQueue::InterruptCallback(
     //
     *ShouldRingDoorBell = FALSE;
     ProcessAsyncList(Status, ShouldRingDoorBell);
+    DPRINT1("ProcessAsyncSchedule completed\n");
 }
 
 VOID
@@ -1090,7 +1122,7 @@ CUSBQueue::CompleteAsyncRequests()
     //
     // is there a pending async entry
     //
-    if (!IsListEmpty(&m_PendingRequestAsyncList))
+    while(!IsListEmpty(&m_PendingRequestAsyncList))
     {
         //
         // remove first entry

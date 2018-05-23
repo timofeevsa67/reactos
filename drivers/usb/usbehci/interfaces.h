@@ -13,7 +13,7 @@
         IN ULONG PhysicalAddress) PURE;                                     \
                                                                             \
     STDMETHOD_(VOID, SetPeriodicListRegister)( THIS_                        \
-        IN ULONG PhysicalAddress) PURE;                                     \
+        IN ULONG PhysicalAddress, IN ULONG PhysicalAddressHigh) PURE;                                     \
                                                                             \
     STDMETHOD_(struct _QUEUE_HEAD *, GetAsyncListQueueHead)( THIS) PURE;    \
                                                                             \
@@ -30,7 +30,7 @@
         IN ULONG PhysicalAddress);                                          \
                                                                             \
     STDMETHODIMP_(VOID) SetPeriodicListRegister(                            \
-        IN ULONG PhysicalAddress);                                          \
+        IN ULONG PhysicalAddress, IN ULONG PhysicalAddressHigh);                                          \
                                                                             \
     STDMETHODIMP_(struct _QUEUE_HEAD *) GetAsyncListQueueHead();            \
                                                                             \

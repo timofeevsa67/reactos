@@ -200,7 +200,7 @@ CUSBHardwareDevice::Initialize(
     Status = GetBusInterface(PhysicalDeviceObject, &BusInterface);
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("Failed to get BusInterface!\n");
+        DPRINT1("Failed to get BusInteface!\n");
         return Status;
     }
 
@@ -485,12 +485,23 @@ CUSBHardwareDevice::StartController(void)
         // change ownership
         //
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_COMMAND_STATUS_OFFSET), OHCI_OWNERSHIP_CHANGE_REQUEST);
-        for(Index = 0; Index < 100; Index++)
+        for(Index = 0; Index < 10; Index++)
         {
             //
-            // wait a bit
+            // delay 50 ms
             //
-            KeStallExecutionProcessor(100);
+            Timeout.QuadPart = 50;
+            DPRINT("Waiting %lu milliseconds for controller change ownership\n", Timeout.LowPart);
+
+            //
+            // convert to 100 ns units (absolute)
+            //
+            Timeout.QuadPart *= -10000;
+
+            //
+            // perform the wait
+            //
+            KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
 
             //
             // check control
@@ -510,11 +521,11 @@ CUSBHardwareDevice::StartController(void)
         //
         if (Control & OHCI_INTERRUPT_ROUTING)
         {
-            DPRINT1("SMM not responding\n");
+            DPRINT1("SMI not responding\n");
         }
         else
         {
-            DPRINT1("SMM has given up ownership\n");
+            DPRINT1("SMI has given up ownership\n");
         }
     }
 
@@ -552,7 +563,7 @@ retry:
         if (!Again)
         {
             //
-            // delay is 100 ms
+            // delay
             //
             Timeout.QuadPart = WaitInMs;
             DPRINT("Waiting %lu milliseconds for controller to transition state\n", Timeout.LowPart);
@@ -575,9 +586,9 @@ retry:
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_COMMAND_STATUS_OFFSET), OHCI_HOST_CONTROLLER_RESET);
 
     //
-    // reset time is 10ms
+    // reset time is 10us
     //
-    for(Index = 0; Index < 100; Index++)
+    for(Index = 0; Index < 10; Index++)
     {
         //
         // wait a bit
@@ -606,6 +617,8 @@ retry:
         //
         // failed to reset controller
         //
+        DPRINT1("Reset OHCI Controller failed.");
+        ASSERT(FALSE);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -640,8 +653,7 @@ retry:
     DPRINT("Read Periodic Start %x\n", Periodic);
 
     // Linux does this hack for some bad controllers
-    if (!(FrameInterval & 0x3FFF0000) ||
-        !(Periodic))
+    if (!(FrameInterval & 0x3FFF0000) || !(Periodic))
     {
         if (!Again)
         {
@@ -667,15 +679,15 @@ retry:
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_BULK_HEAD_ED_OFFSET), m_BulkEndpointDescriptor->PhysicalAddress.LowPart);
 
     //
-    // read descriptor A
-    //
-    Descriptor = READ_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_DESCRIPTOR_A_OFFSET));
-
-    //
     // get port count (in a loop due to AMD errata)
     //
     do
     {
+         //
+         // read descriptor A
+         //
+        Descriptor = READ_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_DESCRIPTOR_A_OFFSET));
+
         KeStallExecutionProcessor(20);
         m_NumberOfPorts = OHCI_RH_GET_PORT_COUNT(Descriptor);
     } while (m_NumberOfPorts == 0);
@@ -770,12 +782,12 @@ retry:
     //
     ASSERT((Control & OHCI_HC_FUNCTIONAL_STATE_MASK) == OHCI_HC_FUNCTIONAL_STATE_OPERATIONAL);
     ASSERT((Control & OHCI_ENABLE_LIST) == OHCI_ENABLE_LIST);
-    DPRINT("Control %x\n", Control);
+    DPRINT("OHCI Control %x\n", Control);
 
     //
     // done
     //
-    DPRINT("OHCI controller is operational\n");
+    DPRINT1("OHCI controller is operational\n");
     return STATUS_SUCCESS;
 }
 
@@ -1063,15 +1075,17 @@ CUSBHardwareDevice::GetPortStatus(
 
     // port disconnect or hardware error
     if (Value & OHCI_RH_PORTSTATUS_PESC)
-        *PortChange |= USB_PORT_STATUS_CONNECT;
-
+         if (!(Value & OHCI_RH_PORTSTATUS_PES))
+         {
+               *PortChange |= USB_PORT_STATUS_ENABLE;
+         }
     // port suspend
     if (Value & OHCI_RH_PORTSTATUS_PSS)
         *PortStatus |= USB_PORT_STATUS_SUSPEND;
 
     // port suspend
     if (Value & OHCI_RH_PORTSTATUS_PSSC)
-        *PortChange |= USB_PORT_STATUS_ENABLE;
+        *PortChange |= USB_PORT_STATUS_SUSPEND;
 
     // port reset started
     if (Value & OHCI_RH_PORTSTATUS_PRS)
@@ -1091,6 +1105,7 @@ CUSBHardwareDevice::ClearPortStatus(
     ULONG Status)
 {
     ULONG Value;
+    LARGE_INTEGER Timeout;
 
     DPRINT("CUSBHardwareDevice::ClearPortStatus PortId %x Feature %x\n", PortId, Status);
 
@@ -1101,23 +1116,41 @@ CUSBHardwareDevice::ClearPortStatus(
 
     if (Status == C_PORT_RESET)
     {
+        if (!(Value & OHCI_RH_PORTSTATUS_PES) && (Value & OHCI_RH_PORTSTATUS_CCS))
+        {
+             //
+             // enable port
+             //
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_PORT_STATUS(PortId)), OHCI_RH_PORTSTATUS_PES);
+        }
+
         //
         // sanity checks
         //
         ASSERT((Value & OHCI_RH_PORTSTATUS_PRSC));
 
         //
-        // clear reset bit complete
+        // clear reset complete bit
         //
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_PORT_STATUS(PortId)), OHCI_RH_PORTSTATUS_PRSC);
 
         //
-        // sanity check
+        // delay is 50 ms
         //
-        ASSERT((Value & OHCI_RH_PORTSTATUS_PES));
+        Timeout.QuadPart = 50;
+        DPRINT1("Waiting %lu milliseconds for port to stabilize after reset\n", Timeout.LowPart);
+        //
+        // convert to 100 ns units (absolute)
+        //
+        Timeout.QuadPart *= -10000;
+
+        //
+        // perform the wait
+        //
+        KeDelayExecutionThread(KernelMode, FALSE, &Timeout);
     }
 
-    if (Status == C_PORT_CONNECTION || Status == C_PORT_ENABLE)
+    else if (Status == C_PORT_CONNECTION || Status == C_PORT_ENABLE)
     {
         //
         // clear change bits
@@ -1129,14 +1162,12 @@ CUSBHardwareDevice::ClearPortStatus(
         //
         if (Status == C_PORT_CONNECTION && (Value & OHCI_RH_PORTSTATUS_CCS))
         {
-            LARGE_INTEGER Timeout;
 
             //
             // delay is 100 ms
             //
             Timeout.QuadPart = 100;
             DPRINT1("Waiting %lu milliseconds for port to stabilize after connection\n", Timeout.LowPart);
-
             //
             // convert to 100 ns units (absolute)
             //
@@ -1149,11 +1180,13 @@ CUSBHardwareDevice::ClearPortStatus(
         }
     }
 
+#if 0
     //
     // re-enable root hub change
     //
     DPRINT("Enabling status change\n");
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_INTERRUPT_ENABLE_OFFSET), OHCI_ROOT_HUB_STATUS_CHANGE);
+#endif
 
     return STATUS_SUCCESS;
 }
@@ -1166,6 +1199,7 @@ CUSBHardwareDevice::SetPortFeature(
     ULONG Feature)
 {
     ULONG Value;
+    LARGE_INTEGER Timeout;
 
     DPRINT("CUSBHardwareDevice::SetPortFeature PortId %x Feature %x\n", PortId, Feature);
 
@@ -1178,14 +1212,20 @@ CUSBHardwareDevice::SetPortFeature(
     if (Feature == PORT_ENABLE)
     {
         //
-        // enable port
+        // sanity check
         //
-        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_PORT_STATUS(PortId)), OHCI_RH_PORTSTATUS_PES);
+        if (!(Value & OHCI_RH_PORTSTATUS_PES) && (Value & OHCI_RH_PORTSTATUS_CCS))
+        {
+             //
+             // enable port
+             //
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_PORT_STATUS(PortId)), OHCI_RH_PORTSTATUS_PES);
+        }
+
         return STATUS_SUCCESS;
     }
     else if (Feature == PORT_POWER)
     {
-        LARGE_INTEGER Timeout;
 
         //
         // enable power
@@ -1207,7 +1247,6 @@ CUSBHardwareDevice::SetPortFeature(
         //
         Timeout.QuadPart *= 2;
         DPRINT("Waiting %lu milliseconds for port power up\n", Timeout.LowPart);
-
         //
         // convert to 100 ns units (absolute)
         //
@@ -1230,20 +1269,27 @@ CUSBHardwareDevice::SetPortFeature(
     }
     else if (Feature == PORT_RESET)
     {
+
         //
         // assert
         //
-        ASSERT((Value & OHCI_RH_PORTSTATUS_CCS));
+        if ((Value & OHCI_RH_PORTSTATUS_CCS))
+        {
+            //
+            // reset port
+            //
+            WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_PORT_STATUS(PortId)), OHCI_RH_PORTSTATUS_PRS);
 
-        //
-        // reset port
-        //
-        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)m_Base + OHCI_RH_PORT_STATUS(PortId)), OHCI_RH_PORTSTATUS_PRS);
-
-        //
-        // an interrupt signals the reset completion
-        //
-        return STATUS_SUCCESS;
+            //
+            // an interrupt signals the reset completion
+            //
+            return STATUS_SUCCESS;
+        }
+        else 
+        {
+            DPRINT1("No device is here on reset. Bad controller/device?\n");
+            return STATUS_DEVICE_NOT_CONNECTED;
+        }
     }
     return STATUS_SUCCESS;
 }
@@ -1389,11 +1435,15 @@ InterruptServiceRoutine(
 
     if (Status & OHCI_ROOT_HUB_STATUS_CHANGE)
     {
+
+#if 0
         //
         // disable interrupt as it will fire untill the port has been reset
         //
         DPRINT1("Disabling status change interrupt\n");
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)This->m_Base + OHCI_INTERRUPT_DISABLE_OFFSET), OHCI_ROOT_HUB_STATUS_CHANGE);
+#endif
+
         Acknowledge |= OHCI_ROOT_HUB_STATUS_CHANGE;
     }
 
@@ -1429,8 +1479,9 @@ OhciDeferredRoutine(
     IN PVOID SystemArgument2)
 {
     CUSBHardwareDevice *This;
-    ULONG CStatus, Index, PortStatus;
-    ULONG DoneHead, QueueSCEWorkItem;
+    ULONG CStatus;
+    //ULONG Index, PortStatus;
+    ULONG DoneHead;
 
     //
     // get parameters
@@ -1450,10 +1501,11 @@ OhciDeferredRoutine(
     }
     if (CStatus & OHCI_ROOT_HUB_STATUS_CHANGE)
     {
+
+#if 0
         //
         // device connected, lets check which port
         //
-        QueueSCEWorkItem = FALSE;
         for(Index = 0; Index < This->m_NumberOfPorts; Index++)
         {
             //
@@ -1476,10 +1528,6 @@ OhciDeferredRoutine(
                     //
                     DPRINT1("New device arrival at Port %lu LowSpeed %x\n", Index, (PortStatus & OHCI_RH_PORTSTATUS_LSDA));
 
-                    //
-                    // enable port
-                    //
-                    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)This->m_Base + OHCI_RH_PORT_STATUS(Index)), OHCI_RH_PORTSTATUS_PES);
                 }
                 else
                 {
@@ -1488,11 +1536,6 @@ OhciDeferredRoutine(
                     //
                     DPRINT1("Device disconnected at Port %x\n", Index);
                 }
-
-                //
-                // work to do
-                //
-                QueueSCEWorkItem = TRUE;
             }
             else if (PortStatus & OHCI_RH_PORTSTATUS_PESC)
             {
@@ -1501,29 +1544,20 @@ OhciDeferredRoutine(
                 //
                 ASSERT(!(PortStatus & OHCI_RH_PORTSTATUS_PES));
 
-                //
-                // work to do
-                //
-                QueueSCEWorkItem = TRUE;
             }
             else if (PortStatus & OHCI_RH_PORTSTATUS_PRSC)
             {
                 //
                 // This is a port reset complete interrupt
                 //
-                DPRINT1("Port %lu completed reset\n", Index);
-
-                //
-                // Queue a work item
-                //
-                QueueSCEWorkItem = TRUE;
+                DPRINT("Port %lu completed reset\n", Index);
             }
         }
-
+#endif
         //
         // is there a status change callback and a device connected / disconnected
         //
-        if (QueueSCEWorkItem && This->m_SCECallBack != NULL)
+        if (This->m_SCECallBack != NULL)
         {
             if (InterlockedCompareExchange(&This->m_StatusChangeWorkItemStatus, 1, 0) == 0)
             {

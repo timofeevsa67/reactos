@@ -272,7 +272,7 @@ CHubController::Initialize(
     //
     // Set the SCE Callback that the Hardware Device will call on port status change
     //
-    Device->SetStatusChangeEndpointCallBack((PVOID)StatusChangeEndpointCallBack, this);
+    Device->SetStatusChangeEndpointCallBack((PVOID)StatusChangeEndpointCallBack, (PVOID)this);
 
     //
     // clear init flag
@@ -293,7 +293,7 @@ CHubController::QueryStatusChangeEndpoint(
     PIO_STACK_LOCATION IoStack;
     USHORT PortStatus, PortChange;
     PURB Urb;
-    PUCHAR TransferBuffer;
+    PUSHORT TransferBuffer;
     UCHAR Changed = FALSE;
 
     //
@@ -314,7 +314,9 @@ CHubController::QueryStatusChangeEndpoint(
     m_Hardware->GetDeviceDetails(NULL, NULL, &PortCount, NULL);
     DPRINT("[%s] SCE Request %p TransferBufferLength %lu Flags %x MDL %p\n", m_USBType, Urb->UrbBulkOrInterruptTransfer.TransferBuffer, Urb->UrbBulkOrInterruptTransfer.TransferBufferLength, Urb->UrbBulkOrInterruptTransfer.TransferFlags, Urb->UrbBulkOrInterruptTransfer.TransferBufferMDL);
 
-    TransferBuffer = (PUCHAR)Urb->UrbBulkOrInterruptTransfer.TransferBuffer;
+    ASSERT(Urb->UrbBulkOrInterruptTransfer.TransferBufferLength >= (2 * sizeof(USHORT) * PortCount));
+
+    TransferBuffer = (PUSHORT)Urb->UrbBulkOrInterruptTransfer.TransferBuffer;
 
     //
     // Loop the ports
@@ -323,17 +325,17 @@ CHubController::QueryStatusChangeEndpoint(
     {
         m_Hardware->GetPortStatus(PortId, &PortStatus, &PortChange);
 
-        DPRINT("[%s] Port %d: Status %x, Change %x\n", m_USBType, PortId, PortStatus, PortChange);
-
+        //DPRINT1("[%s] Port %d: Status %x, Change %x\n", m_USBType, PortId, PortStatus, PortChange);
+        // Set the value for the port number
+       *(TransferBuffer++) = PortStatus;
+       *(TransferBuffer++) = PortChange;
 
         //
         // If there's a flag in PortChange return TRUE so the SCE Irp will be completed
         //
         if (PortChange != 0)
         {
-            DPRINT1("[%s] Change state on port %d\n", m_USBType, PortId);
-            // Set the value for the port number
-             *TransferBuffer = 1 << ((PortId + 1) & 7);
+            DPRINT1("[%s] Change state on port %d, Status %x\n", m_USBType, PortId, PortStatus);
             Changed = TRUE;
         }
     }
@@ -1029,7 +1031,7 @@ CHubController::HandleClassOther(
                     // reset port feature
                     //
                     Status = m_Hardware->SetPortFeature(PortId, PORT_RESET);
-                    PC_ASSERT(Status == STATUS_SUCCESS);
+                    if( !( Status == STATUS_SUCCESS ))  DPRINT1("[%s] Port %x RESET failed\n", m_USBType, PortId);
                     break;
                 }
                 default:
@@ -2742,10 +2744,12 @@ USBHI_CreateUsbDevice(
         return Status;
     }
 
+    //DPRINT1("USBHI_CreateUsbDevice_Initialize: Port %x  Status  %x\n",  (ULONG)PortNumber, (ULONG)PortStatus);
+
     //
     // now initialize device
     //
-    Status = NewUsbDevice->Initialize(PHUBCONTROLLER(Controller), Controller->GetUsbHardware(), HubDeviceHandle, PortNumber, PortStatus);
+    Status = NewUsbDevice->Initialize((PHUBCONTROLLER)Controller, Controller->GetUsbHardware(), HubDeviceHandle, (ULONG)PortNumber, (ULONG)PortStatus);
 
     //
     // check for success
@@ -2778,6 +2782,7 @@ USBHI_CreateUsbDevice(
         return Status;
     }
 
+    DPRINT1("USBHI_CreateUsbDevice done\n");
     //
     // store the handle
     //
